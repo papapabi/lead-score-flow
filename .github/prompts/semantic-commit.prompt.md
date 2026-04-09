@@ -24,7 +24,7 @@ argument-hint: Enter a summary of your code changes (e.g., added login button an
     *   **Casing:** Start the description with a lowercase letter.
     *   **Punctuation:** Do not end the subject line with a period.
     *   **Length:** Keep the subject line under 50 characters if possible, strictly under 72.
-    *   **Body:** Only include a body paragraph if the input provides specific details beyond the main summary. If provided, wrap text at 72 characters.
+    *   **Body:** Only include a body paragraph if the input provides specific details beyond the main summary. If provided, wrap text at 72 characters. Format changes as a Markdown list.
     *   **Language:** English.
 
 **Output Structure:**
