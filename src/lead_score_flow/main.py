@@ -30,8 +30,11 @@ loads inputs, coordinates AI crews, manages review feedback, branches the flow,
 and persists the final communication artifacts.
 """
 
+import argparse
 import asyncio
-from typing import List
+import os
+import sys
+from typing import Any, Callable, Dict, List
 
 # CrewAI Flow primitives:
 #   Flow       – base class that wires decorated methods into a directed execution graph
@@ -41,6 +44,8 @@ from typing import List
 #   or_()      – logical OR helper: the decorated method fires when ANY of the listed events emit
 from crewai.flow.flow import Flow, listen, or_, router, start
 from pydantic import BaseModel
+from rich.console import Console
+from rich.table import Table
 
 # The full job description string used as context when scoring each candidate
 from lead_score_flow.constants import JOB_DESCRIPTION
@@ -361,8 +366,221 @@ def plot():
     lead_score_flow.plot()
 
 
+def _resolve_crewai_test_runtime() -> tuple[int, str]:
+    """Resolve runtime parameters for the `crewai test` command."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "-n",
+        "--n_iterations",
+        type=int,
+        default=int(os.getenv("CREWAI_TEST_N_ITERATIONS", "2")),
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        type=str,
+        default=os.getenv("CREWAI_TEST_MODEL", "gpt-4o-mini"),
+    )
+    known_args, unknown_args = parser.parse_known_args(sys.argv[1:])
+
+    # Backward-compatible positional fallback: "<n_iterations> <model>"
+    if len(unknown_args) >= 2 and unknown_args[0].isdigit():
+        return int(unknown_args[0]), unknown_args[1]
+
+    return known_args.n_iterations, known_args.model
+
+
+def _run_crew_test_summary(
+    crew_builder: Callable[[], Any],
+    *,
+    inputs: Dict[str, Any],
+    n_iterations: int,
+    model_name: str,
+    crew_label: str,
+) -> Dict[str, Any]:
+    """Run one crew test pass and return structured metrics for aggregation."""
+    from crewai.utilities.evaluators.crew_evaluator_handler import CrewEvaluator
+    from crewai.utilities.llm_utils import create_llm
+
+    llm_instance = create_llm(model_name)
+    if not llm_instance:
+        raise ValueError(f"Failed to create evaluator LLM for model '{model_name}'")
+
+    test_crew = crew_builder().copy()
+    evaluator = CrewEvaluator(test_crew, llm_instance)
+
+    for iteration in range(1, n_iterations + 1):
+        evaluator.set_iteration(iteration)
+        test_crew.kickoff(inputs=inputs)
+
+    return {
+        "crew_label": crew_label,
+        "crew": test_crew,
+        "evaluator": evaluator,
+    }
+
+
+def _print_aggregated_test_results(
+    results: List[Dict[str, Any]], n_iterations: int
+) -> None:
+    """Print one consolidated table for all tested crews."""
+    table = Table(
+        title="Aggregated CrewAI Test Scores\n(1-10 Higher is better)",
+    )
+    table.add_column("Crew", style="magenta")
+    table.add_column("Tasks/Crew/Agents", style="cyan")
+    for run in range(1, n_iterations + 1):
+        table.add_column(f"Run {run}", justify="center")
+    table.add_column("Avg. Total", justify="center")
+    table.add_column("Agents", style="green")
+
+    for result in results:
+        crew_label = result["crew_label"]
+        crew = result["crew"]
+        evaluator = result["evaluator"]
+
+        task_averages = [
+            sum(scores) / len(scores)
+            for scores in zip(*evaluator.tasks_scores.values(), strict=False)
+        ]
+
+        for task_index, task in enumerate(crew.tasks):
+            task_scores = [
+                evaluator.tasks_scores[run][task_index]
+                for run in range(1, n_iterations + 1)
+            ]
+            avg_score = task_averages[task_index]
+            agents = list(task.processed_by_agents)
+
+            table.add_row(
+                crew_label,
+                f"Task {task_index + 1}",
+                *[f"{score:.1f}" for score in task_scores],
+                f"{avg_score:.1f}",
+                f"- {agents[0]}" if agents else "",
+            )
+
+            for agent in agents[1:]:
+                table.add_row("", "", *["" for _ in range(n_iterations)], "", f"- {agent}")
+
+        crew_scores = [
+            sum(evaluator.tasks_scores[run]) / len(evaluator.tasks_scores[run])
+            for run in range(1, n_iterations + 1)
+        ]
+        crew_average = sum(crew_scores) / len(crew_scores)
+        table.add_row(
+            crew_label,
+            "Crew",
+            *[f"{score:.2f}" for score in crew_scores],
+            f"{crew_average:.1f}",
+            "",
+        )
+
+        run_exec_times = [
+            int(sum(evaluator.run_execution_times.get(run, [])))
+            for run in range(1, n_iterations + 1)
+        ]
+        execution_time_avg = int(sum(run_exec_times) / len(run_exec_times))
+        table.add_row(
+            crew_label,
+            "Execution Time (s)",
+            *map(str, run_exec_times),
+            f"{execution_time_avg}",
+            "",
+        )
+
+    overall_scores = []
+    overall_exec_times = []
+    for run in range(1, n_iterations + 1):
+        run_task_scores = []
+        run_exec_total = 0
+        for result in results:
+            evaluator = result["evaluator"]
+            run_task_scores.extend(evaluator.tasks_scores.get(run, []))
+            run_exec_total += int(sum(evaluator.run_execution_times.get(run, [])))
+
+        if not run_task_scores:
+            continue
+
+        overall_scores.append(sum(run_task_scores) / len(run_task_scores))
+        overall_exec_times.append(run_exec_total)
+
+    if overall_scores and overall_exec_times:
+        overall_avg = sum(overall_scores) / len(overall_scores)
+        overall_exec_avg = int(sum(overall_exec_times) / len(overall_exec_times))
+        table.add_row(
+            "ALL CREWS",
+            "Overall Crew Score",
+            *[f"{score:.2f}" for score in overall_scores],
+            f"{overall_avg:.1f}",
+            "",
+        )
+        table.add_row(
+            "ALL CREWS",
+            "Overall Execution Time (s)",
+            *map(str, overall_exec_times),
+            f"{overall_exec_avg}",
+            "",
+        )
+
+    console = Console()
+    console.print("\n")
+    console.print(table)
+
+
+def test() -> None:
+    """Run CrewAI tests for both crews with shared runtime settings."""
+    n_iterations, model_name = _resolve_crewai_test_runtime()
+
+    print(
+        "Running CrewAI tests for both crews with "
+        f"n_iterations={n_iterations}, model={model_name}"
+    )
+
+    score_summary = _run_crew_test_summary(
+        lambda: LeadScoreCrew().crew(),
+        inputs={
+            "candidate_id": "24",
+            "name": "Ethan Reed",
+            "bio": (
+                "Self-taught web developer with full-stack experience and AI-driven "
+                "solutions. Built projects with React, Next.js, Vercel AI SDK, and "
+                "REST APIs."
+            ),
+            "job_description": JOB_DESCRIPTION,
+            "additional_instructions": (
+                "Prioritize practical React/Next.js experience and AI integration."
+            ),
+        },
+        n_iterations=n_iterations,
+        model_name=model_name,
+        crew_label="LeadScoreCrew",
+    )
+
+    response_summary = _run_crew_test_summary(
+        lambda: LeadResponseCrew().crew(),
+        inputs={
+            "candidate_id": "24",
+            "name": "Ethan Reed",
+            "bio": (
+                "Self-taught web developer with full-stack experience and AI-driven "
+                "solutions."
+            ),
+            "proceed_with_candidate": True,
+        },
+        n_iterations=n_iterations,
+        model_name=model_name,
+        crew_label="LeadResponseCrew",
+    )
+
+    _print_aggregated_test_results(
+        results=[score_summary, response_summary],
+        n_iterations=n_iterations,
+    )
+
+
 # Allow the module to be run directly with `python main.py` in addition to
 # being invoked through the package CLI entrypoint
-# But this is only optional. The intended way is to run `crewai flow kickoff` in the project root.
+# But this line is only optional. The intended way is to run `crewai flow kickoff` in the project root.
 if __name__ == "__main__":
     kickoff()

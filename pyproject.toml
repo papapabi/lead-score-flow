@@ -18,6 +18,7 @@ dependencies = [
 [project.scripts]
 kickoff = "lead_score_flow.main:kickoff"
 plot = "lead_score_flow.main:plot"
+test = "lead_score_flow.main:test"
 
 [build-system]
 requires = [
